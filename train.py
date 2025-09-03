@@ -388,8 +388,8 @@ class NeRFGaussianSplattingTrainer:
                     grad_threshold,
                     self.scene_extent,
                     percent_dense,
-                    clone_mask,
-                    self.num_points
+                    self.num_points,
+                    clone_mask
                 ]
             )
             
@@ -452,8 +452,8 @@ class NeRFGaussianSplattingTrainer:
                     grad_threshold,
                     self.scene_extent,
                     percent_dense,
-                    split_mask,
-                    self.num_points
+                    self.num_points,
+                    split_mask
                 ]
             )
             
@@ -596,8 +596,8 @@ class NeRFGaussianSplattingTrainer:
                 inputs=[
                     self.params['opacities'],
                     self.config.get('cull_opacity_threshold', 0.005),
-                    valid_mask,
-                    self.num_points
+                    self.num_points,
+                    valid_mask
                 ]
             )
             
@@ -672,9 +672,9 @@ class NeRFGaussianSplattingTrainer:
                 reset_opacities,
                 dim=self.num_points,
                 inputs=[
-                    self.params['opacities'],
                     0.01,  # max_opacity
-                    self.num_points
+                    self.num_points,
+                    self.params['opacities']
                 ]
             )
         
@@ -717,45 +717,45 @@ class NeRFGaussianSplattingTrainer:
             adam_update,
             dim=self.num_points,
             inputs=[
-                # Parameters
-                self.params['positions'],
-                self.params['scales'],
-                self.params['rotations'],
-                self.params['opacities'],
-                self.params['shs'],
-                
-                # Gradients
+                # Gradients (inputs)
                 self.grads['positions'],
                 self.grads['scales'],
                 self.grads['rotations'],
                 self.grads['opacities'],
                 self.grads['shs'],
                 
-                # First moments (m)
+                # Scalar parameters
+                self.num_points,
+                lr_pos,    # Dynamic learning rate for positions
+                lr_scale,  # Dynamic learning rate for scales
+                lr_rot,    # Dynamic learning rate for rotations
+                lr_opac,   # Dynamic learning rate for opacities
+                lr_sh,     # Dynamic learning rate for SH coefficients
+                self.config['adam_beta1'],
+                self.config['adam_beta2'],
+                self.config['adam_epsilon'],
+                iteration,
+                
+                # Output arrays - Parameters
+                self.params['positions'],
+                self.params['scales'],
+                self.params['rotations'],
+                self.params['opacities'],
+                self.params['shs'],
+                
+                # Output arrays - First moments (m)
                 self.adam_m['positions'],
                 self.adam_m['scales'],
                 self.adam_m['rotations'],
                 self.adam_m['opacities'],
                 self.adam_m['shs'],
                 
-                # Second moments (v)
+                # Output arrays - Second moments (v)
                 self.adam_v['positions'],
                 self.adam_v['scales'],
                 self.adam_v['rotations'],
                 self.adam_v['opacities'],
-                self.adam_v['shs'],
-                
-                # Optimizer parameters with dynamic learning rates
-                self.num_points,
-                lr_pos,    # Dynamic learning rate for positions
-                lr_scale,  # Dynamic learning rate for scales
-                lr_rot,    # Dynamic learning rate for rotations
-                lr_sh,     # Dynamic learning rate for SH coefficients
-                lr_opac,   # Dynamic learning rate for opacities
-                self.config['adam_beta1'],
-                self.config['adam_beta2'],
-                self.config['adam_epsilon'],
-                iteration
+                self.adam_v['shs']
             ]
         )
     

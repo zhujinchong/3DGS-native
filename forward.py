@@ -703,7 +703,7 @@ def render_gaussians(
             points_warp,               # orig_points
             scales_warp,               # scales
             scale_modifier,            # scale_modifier
-            rotations_warp,            # rotations_quat
+            rotations_warp,            # rotations
             opacities_warp,            # opacities
             shs_warp,                  # shs
             degree,
@@ -717,6 +717,8 @@ def render_gaussians(
             tan_fovy,                  # tan_fovy
             image_width / (2.0 * tan_fovx),  # focal_x
             image_height / (2.0 * tan_fovy),  # focal_y
+            prefiltered,               # prefiltered
+            antialiasing,              # antialiasing
             radii,                     # radii
             points_xy_image,           # points_xy_image
             depths,                    # depths
@@ -725,9 +727,7 @@ def render_gaussians(
             conic_opacity,             # conic_opacity
             tile_grid,                 # tile_grid
             tiles_touched,             # tiles_touched
-            clamped_state,             # clamped_state - now using wp.vec3
-            prefiltered,               # prefiltered
-            antialiasing               # antialiasing
+            clamped_state,             # clamped_state
         ],
     )
     point_offsets = wp.zeros(num_points, dtype=int, device=DEVICE)
