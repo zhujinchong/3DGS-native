@@ -1,3 +1,21 @@
+"""
+3D Gaussian Splatting - Training Pipeline
+
+TRAINING CONCEPT: Learn a 3D scene representation from 2D images using 3D Gaussians.
+
+FULL 3DGS TRAINING LOOP:
+1. Initialize: Create random 3D Gaussians from sparse point cloud (SfM)
+2. Forward: Render image from current camera view using Gaussian splatting  
+3. Loss: Compare rendered image to ground truth (L1 + SSIM)
+4. Backward: Compute gradients for all Gaussian parameters
+5. Optimize: Update parameters using Adam optimizer
+6. Densify: Add/split/prune Gaussians to improve representation
+7. Repeat until convergence
+
+KEY INSIGHT: No neural networks! Just direct optimization of Gaussian parameters.
+This makes it much faster than NeRF while achieving similar or better quality.
+"""
+
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -863,16 +881,6 @@ class NeRFGaussianSplattingTrainer:
             plt.colorbar(label="depth(z)")
             plt.tight_layout()
             plt.savefig(self.output_path / f"proj_{it:06d}.png", dpi=250)
-            plt.close()
-
-            # depth histogram
-            plt.figure(figsize=(5, 3))
-            plt.hist(depth[mask], bins=40, color="steelblue")
-            plt.xlabel("depth (camera-z)")
-            plt.ylabel("count")
-            plt.title(f"Depth hist – {mask.sum()} pts")
-            plt.tight_layout()
-            plt.savefig(self.output_path / f"depth_hist_{it:06d}.png", dpi=250)
             plt.close()
     
     def train(self):

@@ -15,8 +15,8 @@ WP_INT = wp.int32
 WP_VEC2 = wp.vec2
 WP_VEC2H = wp.vec2h
 VEC6 = wp.types.vector(length=6, dtype=WP_FLOAT32)
-DEVICE = "cpu" # Use "cpu" or "cuda"
-
+# DEVICE = "cpu" # Use "cpu" or "cuda"
+DEVICE = "cuda"
 TILE_M = wp.constant(16)
 TILE_N = wp.constant(16)
 TILE_THREADS = wp.constant(256)

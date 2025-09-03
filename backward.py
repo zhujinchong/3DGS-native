@@ -1,3 +1,18 @@
+"""
+3D Gaussian Splatting - Backward Pass (Gradient Computation)
+
+OPTIMIZATION CONCEPT: 3DGS learns by minimizing the difference between rendered images and training views.
+Unlike NeRF which optimizes neural network weights, 3DGS directly optimizes the Gaussian parameters.
+
+BACKWARD PROCESS:
+1. Compare rendered pixels to ground truth images (L1 + SSIM loss)
+2. Compute gradients w.r.t. final pixel colors  
+3. Propagate gradients backward through the rendering pipeline
+4. Update Gaussian parameters: positions, scales, rotations, opacities, spherical harmonics
+
+The gradients tell us how to adjust each Gaussian to better match the training images.
+"""
+
 import warp as wp
 import math
 from utils.wp_utils import to_warp_array, wp_vec3_mul_element, wp_vec3_add_element, wp_vec3_sqrt, wp_vec3_div_element, wp_vec3_clamp

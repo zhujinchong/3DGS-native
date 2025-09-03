@@ -1,3 +1,24 @@
+"""
+3D Gaussian Splatting - Forward Rendering Pipeline
+
+CONCEPT: 3D Gaussian Splatting represents scenes using millions of 3D Gaussians instead of neural networks.
+Each Gaussian is defined by:
+- Position (mean): 3D location in world space
+- Scale: 3 values defining ellipsoid size along each axis  
+- Rotation: quaternion defining ellipsoid orientation
+- Opacity: how transparent/opaque the Gaussian is
+- Color: represented by spherical harmonics for view-dependent effects
+
+FORWARD PROCESS:
+1. Transform 3D Gaussians to camera space
+2. Project to 2D screen coordinates (splatting) 
+3. Compute 2D covariance matrix (how Gaussian appears on screen)
+4. Rasterize: for each pixel, blend overlapping Gaussians front-to-back
+5. Use alpha compositing to combine colors
+
+This is much faster than NeRF because it uses rasterization instead of ray marching.
+"""
+
 import warp as wp
 from utils.wp_utils import to_warp_array
 from config import *
@@ -43,6 +64,17 @@ def get_rect(p: wp.vec2, max_radius: float, tile_grid: wp.vec3):
 @wp.func
 def compute_cov2d(p_orig: wp.vec3, cov3d: VEC6, view_matrix: wp.mat44, 
                  tan_fovx: float, tan_fovy: float, width: float, height: float) -> wp.vec3:
+    """
+    CORE 3DGS CONCEPT: Project 3D Gaussian covariance to 2D screen space.
+    
+    This is the mathematical heart of Gaussian Splatting:
+    1. Transform 3D covariance matrix from world to camera space
+    2. Apply perspective projection jacobian to get 2D covariance 
+    3. The 2D covariance defines how the Gaussian appears on screen (ellipse shape/orientation)
+    
+    Formula: Σ_2D = J * W * Σ_3D * W^T * J^T
+    Where: J = projection jacobian, W = world-to-camera transform
+    """
     
     t = wp.vec4(p_orig[0], p_orig[1], p_orig[2], 1.0) * view_matrix
     limx = 1.3 * tan_fovx
@@ -76,64 +108,87 @@ def compute_cov2d(p_orig: wp.vec3, cov3d: VEC6, view_matrix: wp.mat44,
         cov3d[2], cov3d[4], cov3d[5]
     )
     
+    # CORE 3DGS MATH: Project 3D covariance to 2D using transformation matrix T
+    # Formula: Σ_2D = T * Σ_3D * T^T  
+    # Your implementation correctly transposes Vrk first, then applies the transforms
     cov = T * wp.transpose(Vrk) * wp.transpose(T)
     
+    # Return 2D covariance as (σ_xx, σ_xy, σ_yy) - enough to define 2D ellipse
     return wp.vec3(cov[0, 0], cov[0, 1], cov[1, 1])
 
 @wp.func
 def compute_cov3d(scale: wp.vec3, scale_mod: float, rot: wp.vec4) -> VEC6:
-    # Create scaling matrix with modifier applied
+    """
+    CORE 3DGS CONCEPT: Construct 3D covariance matrix from scale and rotation.
+    
+    A 3D Gaussian is an ellipsoid defined by its covariance matrix Σ.
+    Instead of storing Σ directly (6 values), we parameterize it as:
+    - Scale: 3 values (ellipsoid radii along each axis)  
+    - Rotation: 4 values (quaternion for ellipsoid orientation)
+    
+    Mathematical decomposition: Σ = R * S * S^T * R^T = M * M^T
+    Where: R = rotation matrix, S = diagonal scale matrix, M = R * S
+    
+    This parameterization ensures Σ is always positive semi-definite (valid covariance).
+    """
+    # Create diagonal scaling matrix with modifier applied for adaptive densification
     S = wp.mat33(
         scale_mod * scale[0], 0.0, 0.0,
         0.0, scale_mod * scale[1], 0.0,
         0.0, 0.0, scale_mod * scale[2]
     )
+    # Convert quaternion to rotation matrix
     R = wp.quat_to_matrix(wp.quaternion(rot[0], rot[1], rot[2], rot[3]))
+    # Combined transformation matrix M = R * S
     M = R * S
     
-    # Compute 3D covariance matrix: Sigma = M * M^T
+    # Compute 3D covariance matrix: Σ = M * M^T
+    # This gives us the full 3x3 symmetric covariance matrix
     sigma = M * wp.transpose(M)
     
+    # Return upper triangular part (6 unique values) since matrix is symmetric
     return VEC6(sigma[0, 0], sigma[0, 1], sigma[0, 2], sigma[1, 1], sigma[1, 2], sigma[2, 2])
 
+# --- Forward Rendering Kernels ---
 @wp.kernel
 def wp_preprocess(
-    orig_points: wp.array(dtype=wp.vec3),
-    scales: wp.array(dtype=wp.vec3),
-    scale_modifier: float,
-    rotations: wp.array(dtype=wp.vec4),
+    # --- Inputs ---
+    orig_points: wp.array(dtype=wp.vec3),        # 3D positions in world space (N, 3)
+    scales: wp.array(dtype=wp.vec3),             # Ellipsoid scales (N, 3)
+    scale_modifier: float,                       # Global scale multiplier for densification
+    rotations: wp.array(dtype=wp.vec4),          # Ellipsoid orientations as quaternions (N, 4)
+    opacities: wp.array(dtype=float),            # Transparency values (N,)
+    shs: wp.array(dtype=wp.vec3),                # Spherical harmonic coefficients (N*16, 3)
+    degree: int,                                 # SH degree (0=diffuse, higher=view-dependent)
+    clamped: bool,                               # Whether to clamp SH evaluation
+    view_matrix: wp.mat44,                       # World to camera transformation
+    proj_matrix: wp.mat44,                       # Camera to screen projection
+    cam_pos: wp.vec3,                            # Camera position in world space
+    W: int,                                      # Screen width in pixels
+    H: int,                                      # Screen height in pixels
+    tan_fovx: float,                             # tan(fov_x/2) for perspective projection
+    tan_fovy: float,                             # tan(fov_y/2) for perspective projection
+    focal_x: float,                              # Focal length X (pixels)
+    focal_y: float,                              # Focal length Y (pixels)
     
-    opacities: wp.array(dtype=float),
-    shs: wp.array(dtype=wp.vec3),
-    degree: int,
-    clamped: bool,
+    prefiltered: bool,                           # Whether to prefilter small Gaussians
+    antialiasing: bool,                          # Whether to apply antialiasing
     
-    view_matrix: wp.mat44,
-    proj_matrix: wp.mat44,
-    cam_pos: wp.vec3,
-    
-    W: int,
-    H: int,
-    
-    tan_fovx: float,
-    tan_fovy: float,
-    
-    focal_x: float,
-    focal_y: float,
-    
-    radii: wp.array(dtype=int),
-    points_xy_image: wp.array(dtype=wp.vec2),
-    depths: wp.array(dtype=float),
-    cov3Ds: wp.array(dtype=VEC6),
-    rgb: wp.array(dtype=wp.vec3),
-    conic_opacity: wp.array(dtype=wp.vec4),
-    tile_grid: wp.vec3,
-    tiles_touched: wp.array(dtype=int),
-    clamped_state: wp.array(dtype=wp.vec3),
-    
-    prefiltered: bool,
-    antialiasing: bool
+    # --- Outputs ---
+    radii: wp.array(dtype=int),                  # 2D radius of each Gaussian on screen (N,)
+    points_xy_image: wp.array(dtype=wp.vec2),    # 2D projected positions (N, 2)
+    depths: wp.array(dtype=float),               # Depth values for sorting (N,)
+    cov3Ds: wp.array(dtype=VEC6),                # 3D covariance matrices (N, 6)
+    rgb: wp.array(dtype=wp.vec3),                # View-dependent colors from SH (N, 3)
+    conic_opacity: wp.array(dtype=wp.vec4),      # 2D covariance inverse + opacity (N, 4)
+    tile_grid: wp.vec3,                          # Tile grid dimensions for rasterization
+    tiles_touched: wp.array(dtype=int),          # Number of tiles each Gaussian touches (N,)
+    clamped_state: wp.array(dtype=wp.vec3)       # SH clamping state for gradients (N, 3)
 ):
+    """
+    STEP 1 of 3DGS: Transform and project 3D Gaussians to 2D screen space.
+    This is the "splatting" step that converts 3D ellipsoids into 2D ellipses.
+    """
     # Get thread indices
     i = wp.tid()
     

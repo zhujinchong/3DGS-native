@@ -2,46 +2,42 @@ import warp as wp
 from utils.wp_utils import to_warp_array, wp_vec3_mul_element, wp_vec3_add_element, wp_vec3_sqrt, wp_vec3_div_element, wp_vec3_clamp
 from config import *
 
+# --- Optimizer Kernels ---
 @wp.kernel
 def adam_update(
-    # Parameters
-    positions: wp.array(dtype=wp.vec3),
-    scales: wp.array(dtype=wp.vec3),
-    rotations: wp.array(dtype=wp.vec4),
-    opacities: wp.array(dtype=float),
-    shs: wp.array(dtype=wp.vec3),
+    # --- Inputs ---
+    pos_grads: wp.array(dtype=wp.vec3),          # Position gradients (N, 3)
+    scale_grads: wp.array(dtype=wp.vec3),        # Scale gradients (N, 3)
+    rot_grads: wp.array(dtype=wp.vec4),          # Rotation gradients (N, 4)
+    opacity_grads: wp.array(dtype=float),        # Opacity gradients (N,)
+    sh_grads: wp.array(dtype=wp.vec3),           # SH gradients (N * 16, 3)
+    num_points: int,                             # Total number of Gaussian points
+    lr_pos: float,                               # Learning rate for positions
+    lr_scale: float,                             # Learning rate for scales
+    lr_rot: float,                               # Learning rate for rotations
+    lr_opac: float,                              # Learning rate for opacities
+    lr_sh: float,                                # Learning rate for spherical harmonics
+    beta1: float,                                # Adam beta1 parameter (momentum)
+    beta2: float,                                # Adam beta2 parameter (RMSprop)
+    epsilon: float,                              # Small constant for numerical stability
+    iteration: int,                              # Current training iteration (for bias correction)
     
-    # Gradients
-    pos_grads: wp.array(dtype=wp.vec3),
-    scale_grads: wp.array(dtype=wp.vec3),
-    rot_grads: wp.array(dtype=wp.vec4),
-    opacity_grads: wp.array(dtype=float),
-    sh_grads: wp.array(dtype=wp.vec3),
-    
-    # First moments (m)
-    m_positions: wp.array(dtype=wp.vec3),
-    m_scales: wp.array(dtype=wp.vec3),
-    m_rotations: wp.array(dtype=wp.vec4),
-    m_opacities: wp.array(dtype=float),
-    m_shs: wp.array(dtype=wp.vec3),
-    
-    # Second moments (v)
-    v_positions: wp.array(dtype=wp.vec3),
-    v_scales: wp.array(dtype=wp.vec3),
-    v_rotations: wp.array(dtype=wp.vec4),
-    v_opacities: wp.array(dtype=float),
-    v_shs: wp.array(dtype=wp.vec3),
-    
-    num_points: int,
-    lr_pos: float,
-    lr_scale: float,
-    lr_rot: float,
-    lr_opac: float,
-    lr_sh: float,
-    beta1: float,
-    beta2: float,
-    epsilon: float,
-    iteration: int
+    # --- Outputs ---
+    positions: wp.array(dtype=wp.vec3),          # 3D positions of Gaussians (N, 3)
+    scales: wp.array(dtype=wp.vec3),             # Scale parameters (N, 3) - kept positive
+    rotations: wp.array(dtype=wp.vec4),          # Rotation quaternions (N, 4) - normalized
+    opacities: wp.array(dtype=float),            # Opacity values (N,) - clamped to [0,1]
+    shs: wp.array(dtype=wp.vec3),                # Spherical harmonic coefficients (N * 16, 3)
+    m_positions: wp.array(dtype=wp.vec3),        # Running average of position gradients (N, 3)
+    m_scales: wp.array(dtype=wp.vec3),           # Running average of scale gradients (N, 3)
+    m_rotations: wp.array(dtype=wp.vec4),        # Running average of rotation gradients (N, 4)
+    m_opacities: wp.array(dtype=float),          # Running average of opacity gradients (N,)
+    m_shs: wp.array(dtype=wp.vec3),              # Running average of SH gradients (N * 16, 3)
+    v_positions: wp.array(dtype=wp.vec3),        # Running average of squared position gradients (N, 3)
+    v_scales: wp.array(dtype=wp.vec3),           # Running average of squared scale gradients (N, 3)
+    v_rotations: wp.array(dtype=wp.vec4),        # Running average of squared rotation gradients (N, 4)
+    v_opacities: wp.array(dtype=float),          # Running average of squared opacity gradients (N,)
+    v_shs: wp.array(dtype=wp.vec3)               # Running average of squared SH gradients (N * 16, 3)
 ):
     i = wp.tid()
     if i >= num_points:
@@ -143,13 +139,17 @@ def adam_update(
         shs[idx] = shs[idx] - lr_sh * wp_vec3_div_element(m_sh_corrected, denominator_sh)
 
 
+# --- Densification Support Kernels ---
 @wp.kernel
 def reset_opacities(
-    opacities: wp.array(dtype=float),
-    max_opacity: float,
-    num_points: int
+    # --- Inputs ---
+    max_opacity: float,                          # Maximum opacity value after reset
+    num_points: int,                             # Total number of points to process
+    
+    # --- Outputs ---
+    opacities: wp.array(dtype=float)             # Opacity values to reset (N,)
 ):
-    """Reset opacities to prevent oversaturation."""
+    """Reset opacities to prevent oversaturation during training."""
     i = wp.tid()
     if i >= num_points:
         return
@@ -159,10 +159,13 @@ def reset_opacities(
 
 @wp.kernel
 def reset_densification_stats(
-    xyz_gradient_accum: wp.array(dtype=float),
-    denom: wp.array(dtype=float),
-    max_radii2D: wp.array(dtype=float),
-    num_points: int
+    # --- Inputs ---
+    num_points: int,                             # Total number of points to process
+    
+    # --- Outputs ---
+    xyz_gradient_accum: wp.array(dtype=float),   # Accumulated XYZ gradients to reset (N,)
+    denom: wp.array(dtype=float),                # Gradient count denominator to reset (N,)
+    max_radii2D: wp.array(dtype=float)           # Maximum 2D radii to reset (N,)
 ):
     """Reset densification statistics after parameter count changes."""
     i = wp.tid()
@@ -176,13 +179,16 @@ def reset_densification_stats(
 
 @wp.kernel
 def mark_split_candidates(
-    grads: wp.array(dtype=float),
-    scales: wp.array(dtype=wp.vec3),
-    grad_threshold: float,
-    scene_extent: float,
-    percent_dense: float,
-    split_mask: wp.array(dtype=int),
-    num_points: int
+    # --- Inputs ---
+    grads: wp.array(dtype=float),                # Average gradient magnitudes (N,)
+    scales: wp.array(dtype=wp.vec3),             # Scale parameters (N, 3)
+    grad_threshold: float,                       # Minimum gradient for splitting
+    scene_extent: float,                         # Scene extent for scale threshold
+    percent_dense: float,                        # Percentage of scene extent for threshold
+    num_points: int,                             # Total number of points
+    
+    # --- Outputs ---
+    split_mask: wp.array(dtype=int)              # Binary mask marking candidates for splitting (N,)
 ):
     """Mark large Gaussians with high gradients for splitting."""
     i = wp.tid()
@@ -205,13 +211,16 @@ def mark_split_candidates(
 
 @wp.kernel
 def mark_clone_candidates(
-    grads: wp.array(dtype=float),
-    scales: wp.array(dtype=wp.vec3),
-    grad_threshold: float,
-    scene_extent: float,
-    percent_dense: float,
-    clone_mask: wp.array(dtype=int),
-    num_points: int
+    # --- Inputs ---
+    grads: wp.array(dtype=float),                # Average gradient magnitudes (N,)
+    scales: wp.array(dtype=wp.vec3),             # Scale parameters (N, 3)
+    grad_threshold: float,                       # Minimum gradient for cloning
+    scene_extent: float,                         # Scene extent for scale threshold
+    percent_dense: float,                        # Percentage of scene extent for threshold
+    num_points: int,                             # Total number of points
+    
+    # --- Outputs ---
+    clone_mask: wp.array(dtype=int)              # Binary mask marking candidates for cloning (N,)
 ):
     """Mark small Gaussians with high gradients for cloning."""
     i = wp.tid()
@@ -354,11 +363,15 @@ def clone_gaussians(
 
 @wp.kernel
 def prune_gaussians(
-    opacities: wp.array(dtype=float),
-    opacity_threshold: float,
-    valid_mask: wp.array(dtype=int),
-    num_points: int
+    # --- Inputs ---
+    opacities: wp.array(dtype=float),            # Opacity values (N,)
+    opacity_threshold: float,                    # Minimum opacity threshold for keeping
+    num_points: int,                             # Total number of points
+    
+    # --- Outputs ---
+    valid_mask: wp.array(dtype=int)              # Binary mask: 1=keep, 0=prune (N,)
 ):
+    """Mark Gaussians for pruning based on opacity threshold."""
     i = wp.tid()
     if i >= num_points:
         return
@@ -370,20 +383,23 @@ def prune_gaussians(
 
 @wp.kernel
 def compact_gaussians(
-    valid_mask: wp.array(dtype=int),
-    prefix_sum: wp.array(dtype=int),
-    positions: wp.array(dtype=wp.vec3),
-    scales: wp.array(dtype=wp.vec3),
-    rotations: wp.array(dtype=wp.vec4),
-    opacities: wp.array(dtype=float),
-    shs: wp.array(dtype=wp.vec3),  # shape: [N * 16]
+    # --- Inputs ---
+    valid_mask: wp.array(dtype=int),             # Binary mask: 1=keep, 0=prune (N,)
+    prefix_sum: wp.array(dtype=int),             # Prefix sum for compaction indices (N,)
+    positions: wp.array(dtype=wp.vec3),          # Original positions (N, 3)
+    scales: wp.array(dtype=wp.vec3),             # Original scales (N, 3)
+    rotations: wp.array(dtype=wp.vec4),          # Original rotations (N, 4)
+    opacities: wp.array(dtype=float),            # Original opacities (N,)
+    shs: wp.array(dtype=wp.vec3),                # Original SH coefficients (N * 16, 3)
 
-    out_positions: wp.array(dtype=wp.vec3),
-    out_scales: wp.array(dtype=wp.vec3),
-    out_rotations: wp.array(dtype=wp.vec4),
-    out_opacities: wp.array(dtype=float),
-    out_shs: wp.array(dtype=wp.vec3)
+    # --- Outputs ---
+    out_positions: wp.array(dtype=wp.vec3),      # Compacted positions (M, 3) where M = num_valid
+    out_scales: wp.array(dtype=wp.vec3),         # Compacted scales (M, 3)
+    out_rotations: wp.array(dtype=wp.vec4),      # Compacted rotations (M, 4)
+    out_opacities: wp.array(dtype=float),        # Compacted opacities (M,)
+    out_shs: wp.array(dtype=wp.vec3)             # Compacted SH coefficients (M * 16, 3)
 ):
+    """Compact Gaussian arrays by removing invalid points using prefix sum."""
     i = wp.tid()
     if valid_mask[i] == 0:
         return
