@@ -1,26 +1,41 @@
 """
 3D Gaussian Splatting - Forward Rendering Pipeline
 
-CONCEPT: 3D Gaussian Splatting represents scenes using millions of 3D Gaussians instead of neural networks.
-Each Gaussian is defined by:
-- Position (mean): 3D location in world space
-- Scale: 3 values defining ellipsoid size along each axis  
-- Rotation: quaternion defining ellipsoid orientation
-- Opacity: how transparent/opaque the Gaussian is
-- Color: represented by spherical harmonics for view-dependent effects
+Mathematical Foundation:
+Each 3D Gaussian G_i is defined by parameters (μ_i, Σ_i, α_i, c_i):
+- μ_i ∈ ℝ³: 3D position (mean of Gaussian distribution)
+- Σ_i ∈ ℝ³ˣ³: 3D covariance matrix (defines ellipsoid shape)
+- α_i ∈ [0,1]: opacity (controls transparency)
+- c_i: view-dependent color from spherical harmonics
 
-FORWARD PROCESS:
-1. Transform 3D Gaussians to camera space
-2. Project to 2D screen coordinates (splatting) 
-3. Compute 2D covariance matrix (how Gaussian appears on screen)
-4. Rasterize: for each pixel, blend overlapping Gaussians front-to-back
-5. Use alpha compositing to combine colors
+The 3D Gaussian function: G_i(x) = exp(-½(x-μ_i)ᵀΣ_i⁻¹(x-μ_i))
 
-This is much faster than NeRF because it uses rasterization instead of ray marching.
+Rendering Pipeline:
+1. PARAMETERIZATION: Represent each Gaussian with learnable parameters
+   - Position μ directly optimizable
+   - Covariance Σ = RSS^TR^T (rotation R + scale S for stability) → compute_cov3d()
+   - Colors from spherical harmonics c(d) = Σ_l c_l Y_l(d)
+   
+2. CULLING & PROJECTION: Transform to screen space → wp_preprocess()
+   - Frustum culling: remove Gaussians outside view
+   - Project μ_i to 2D: p_i = π(Tμ_i) where T is view transform
+   - EWA splatting: project 3D covariance Σ_i to 2D covariance Σ'_i → compute_cov2d()
+   
+3. TILE-BASED RASTERIZATION: Efficient GPU rendering
+   - Divide screen into 16×16 tiles for parallel processing
+   - Sort Gaussians by depth per tile (painter's algorithm) → wp_duplicate_with_keys(), wp_identify_tile_ranges()
+   - Alpha compositing: C = Σ_i α_i c_i ∏_{j<i}(1-α_j) → wp_render_gaussians()
+   
+4. DIFFERENTIABLE RENDERING: Enable gradient-based optimization
+   - All operations differentiable w.r.t. Gaussian parameters
+   - Gradients flow from pixel loss back to μ, Σ, α, c parameters
+
+Key Innovation: Replace slow volumetric rendering with fast rasterization
+while maintaining differentiability for end-to-end neural optimization.
 """
 
 import warp as wp
-from utils.wp_utils import to_warp_array
+from utils.wp_utils import to_warp_array, wp_prefix_sum, wp_copy_int64, wp_copy_int
 from config import *
 # Initialize Warp
 wp.init()
@@ -65,15 +80,27 @@ def get_rect(p: wp.vec2, max_radius: float, tile_grid: wp.vec3):
 def compute_cov2d(p_orig: wp.vec3, cov3d: VEC6, view_matrix: wp.mat44, 
                  tan_fovx: float, tan_fovy: float, width: float, height: float) -> wp.vec3:
     """
-    CORE 3DGS CONCEPT: Project 3D Gaussian covariance to 2D screen space.
+    PIPELINE STEP 2: EWA SPLATTING
+    Project 3D Gaussian to 2D screen space using EWA (Elliptical Weighted Average) splatting.
     
-    This is the mathematical heart of Gaussian Splatting:
-    1. Transform 3D covariance matrix from world to camera space
-    2. Apply perspective projection jacobian to get 2D covariance 
-    3. The 2D covariance defines how the Gaussian appears on screen (ellipse shape/orientation)
+    Key insight: When we view a 3D Gaussian from a camera, it appears as a 2D Gaussian
+    on the image plane. We need to compute this 2D covariance for rendering.
     
-    Formula: Σ_2D = J * W * Σ_3D * W^T * J^T
-    Where: J = projection jacobian, W = world-to-camera transform
+    The projection formula: Σ_2D = J * W * Σ_3D * W^T * J^T
+    
+    Breaking it down:
+    1. W transforms from world to camera space (viewing transformation)
+    2. Σ_3D is our 3D Gaussian's covariance in world space
+    3. J is the Jacobian of the perspective projection (handles depth scaling)
+    
+    The Jacobian J captures how perspective projection distorts the Gaussian:
+    - Objects farther away appear smaller (1/z scaling)
+    - Off-center objects get stretched (perspective distortion)
+    
+    The result is a 2x2 covariance matrix that tells us:
+    - The size of the Gaussian splat on screen
+    - Its orientation (elongation direction)
+    - How to properly blend it with other Gaussians
     """
     
     t = wp.vec4(p_orig[0], p_orig[1], p_orig[2], 1.0) * view_matrix
@@ -119,17 +146,26 @@ def compute_cov2d(p_orig: wp.vec3, cov3d: VEC6, view_matrix: wp.mat44,
 @wp.func
 def compute_cov3d(scale: wp.vec3, scale_mod: float, rot: wp.vec4) -> VEC6:
     """
-    CORE 3DGS CONCEPT: Construct 3D covariance matrix from scale and rotation.
+    PIPELINE STEP 1: PARAMETERIZATION
+    Build 3D covariance matrix that defines the shape of our Gaussian ellipsoid.
     
-    A 3D Gaussian is an ellipsoid defined by its covariance matrix Σ.
-    Instead of storing Σ directly (6 values), we parameterize it as:
-    - Scale: 3 values (ellipsoid radii along each axis)  
-    - Rotation: 4 values (quaternion for ellipsoid orientation)
+    A 3D Gaussian has the form: G(x) = exp(-0.5 * (x-μ)^T * Σ^(-1) * (x-μ))
+    where Σ is the covariance matrix that controls the Gaussian's shape.
     
-    Mathematical decomposition: Σ = R * S * S^T * R^T = M * M^T
-    Where: R = rotation matrix, S = diagonal scale matrix, M = R * S
+    Instead of directly optimizing Σ (which could become invalid), we decompose it as:
+    Σ = R * S * S^T * R^T
     
-    This parameterization ensures Σ is always positive semi-definite (valid covariance).
+    Where:
+    - S = diagonal matrix with our scale parameters (ellipsoid radii)  
+    - R = rotation matrix from quaternion (ellipsoid orientation)
+    
+    Why this works:
+    1. Guarantees Σ is positive semi-definite (valid probability distribution)
+    2. Scales can be constrained > 0 during optimization (no invalid states)
+    3. Quaternions naturally parameterize rotations (no gimbal lock)
+    4. Only need 7 parameters (3 scales + 4 quaternion) vs 6 for raw covariance
+    
+    The final covariance determines how the Gaussian "spreads" in 3D space.
     """
     # Create diagonal scaling matrix with modifier applied for adaptive densification
     S = wp.mat33(
@@ -186,8 +222,23 @@ def wp_preprocess(
     clamped_state: wp.array(dtype=wp.vec3)       # SH clamping state for gradients (N, 3)
 ):
     """
-    STEP 1 of 3DGS: Transform and project 3D Gaussians to 2D screen space.
-    This is the "splatting" step that converts 3D ellipsoids into 2D ellipses.
+    PIPELINE STEP 2: CULLING & PROJECTION
+    Transform 3D Gaussians to screen space and prepare for rasterization.
+    
+    This kernel performs the critical "splatting" operation:
+    1. Frustum culling: remove Gaussians outside camera view
+    2. Perspective projection: μ_i → p_i = π(T·μ_i) 
+    3. EWA splatting: project 3D covariance Σ_3D → Σ_2D
+    4. Spherical harmonics evaluation: compute view-dependent colors
+    5. Tile determination: which screen tiles does each Gaussian affect?
+    
+    Mathematical core: For each Gaussian i:
+    - Build 3D covariance: Σ₃D = RSS^TR^T
+    - Project to 2D: Σ₂D = J·W·Σ₃D·W^T·J^T (EWA transformation)
+    - Evaluate SH color: c = Σₗ cₗYₗ(view_direction)
+    - Compute 2D extent: radius ≈ 3σ (covers 99.7% of Gaussian mass)
+    
+    Performance critical: Determines what gets rendered and how.
     """
     # Get thread indices
     i = wp.tid()
@@ -329,38 +380,27 @@ def wp_preprocess(
 
 @wp.kernel
 def wp_render_gaussians(
-    # Output buffers
+    # --- Outputs ---
     rendered_image: wp.array2d(dtype=wp.vec3),
     depth_image: wp.array2d(dtype=float),
     
-    # Tile data
+    # --- Inputs ---
     ranges: wp.array(dtype=wp.vec2i),
     point_list: wp.array(dtype=int),
-    
-    # Image parameters
     W: int,
     H: int,
-    
-    # Gaussian data
     points_xy_image: wp.array(dtype=wp.vec2),
     colors: wp.array(dtype=wp.vec3),
     conic_opacity: wp.array(dtype=wp.vec4),
     depths: wp.array(dtype=float),
-    
-    # Background color
     background: wp.vec3,
-    
-    # Tile grid info
     tile_grid: wp.vec3,
-    
-    # Track additional data
     final_Ts: wp.array2d(dtype=float),
     n_contrib: wp.array2d(dtype=int),
 ):
     tile_x, tile_y, tid_x, tid_y = wp.tid()
     
     # Calculate tile index
-    
     if tile_y >= (H + TILE_N - 1) // TILE_N:
         return
     
@@ -387,16 +427,27 @@ def wp_render_gaussians(
     range_start = ranges[tile_id][0]
     range_end = ranges[tile_id][1]
     
-    # Initialize blending variables
-    T = float(1.0)  # Transmittance
-    r, g, b = float(0.0), float(0.0), float(0.0)  # Accumulated color
-    expected_inv_depth = float(0.0)  # For depth calculation
+    # ALPHA COMPOSITING: Core rendering equation for transparency
+    # Mathematical formulation: C = Σᵢ αᵢcᵢ ∏ⱼ<ᵢ(1-αⱼ) + T_final * background
+    # Where:
+    # - αᵢ = opacity of Gaussian i at this pixel
+    # - cᵢ = color of Gaussian i (from spherical harmonics)
+    # - T = transmittance = ∏ⱼ≤ᵢ(1-αⱼ) (fraction of light transmitted through layers 0...i)
+    #
+    # Physical interpretation: Light travels from background through transparent
+    # layers, getting attenuated and colored by each Gaussian it encounters
+    #
+    # Implementation note: We render front-to-back (far to near) with early 
+    # termination when T becomes negligible (pixel effectively opaque)
     
-    # Track the number of contributors to this pixel
+    T = float(1.0)  # (starts fully transparent)
+    r, g, b = float(0.0), float(0.0), float(0.0)
+    expected_inv_depth = float(0.0)
+    
     contributor_count = int(0)
     last_contributor = int(0)
     
-    # Iterate over all Gaussians influencing this tile
+    # Process all depth-sorted Gaussians affecting this tile (front-to-back)
     for i in range(range_start, range_end):
         # Get Gaussian ID
         gaussian_id = point_list[i]
@@ -533,31 +584,6 @@ def wp_identify_tile_ranges(
 
 
 @wp.kernel
-def wp_prefix_sum(input_array: wp.array(dtype=int),
-                      output_array: wp.array(dtype=int)):
-    tid = wp.tid()
-    
-    if tid == 0:
-        output_array[0] = input_array[0]
-        
-        # Perform prefix sum
-        for i in range(1, input_array.shape[0]):
-            output_array[i] = output_array[i-1] + input_array[i]
-
-
-@wp.kernel
-def wp_copy_int64(src: wp.array(dtype=wp.int64), dst: wp.array(dtype=wp.int64), count: int):
-    i = wp.tid()
-    if i < count:
-        dst[i] = src[i]
-        
-@wp.kernel
-def wp_copy_int(src: wp.array(dtype=int), dst: wp.array(dtype=int), count: int):
-    i = wp.tid()
-    if i < count:
-        dst[i] = src[i]
-        
-@wp.kernel
 def track_pixel_stats(
     rendered_image: wp.array2d(dtype=wp.vec3),
     depth_image: wp.array2d(dtype=float),
@@ -646,38 +672,30 @@ def render_gaussians(
     Returns:
         Tuple of (rendered_image, depth_image, intermediate_buffers)
     """
+    # === PIPELINE STEP 1: SETUP & CONVERSION ===
     rendered_image = wp.zeros((image_height, image_width), dtype=wp.vec3, device=DEVICE)
     depth_image = wp.zeros((image_height, image_width), dtype=float, device=DEVICE)
-    
-    # Create additional buffers for tracking transparency and contributors
     final_Ts = wp.zeros((image_height, image_width), dtype=float, device=DEVICE)
     n_contrib = wp.zeros((image_height, image_width), dtype=int, device=DEVICE)
 
     background_warp = wp.vec3(background[0], background[1], background[2])
     points_warp = to_warp_array(means3D, wp.vec3)
     
-
-    # SH coefficients should be shape (n, 16, 3)
-    # Convert to a flattened array but preserve the structure
     sh_data = sh.reshape(-1, 3) if hasattr(sh, 'reshape') else sh
     shs_warp = to_warp_array(sh_data, wp.vec3)
     
-    # Handle other parameters
     opacities_warp = to_warp_array(opacity, float, flatten=True)
     scales_warp = to_warp_array(scales, wp.vec3)
     rotations_warp = to_warp_array(rotations, wp.vec4)
 
-    # Handle camera parameters
     view_matrix_warp = wp.mat44(viewmatrix.flatten()) if not isinstance(viewmatrix, wp.mat44) else viewmatrix
     proj_matrix_warp = wp.mat44(projmatrix.flatten()) if not isinstance(projmatrix, wp.mat44) else projmatrix
     campos_warp = wp.vec3(campos[0], campos[1], campos[2]) if not isinstance(campos, wp.vec3) else campos
     
-    # Calculate tile grid for spatial optimization
     tile_grid = wp.vec3((image_width + TILE_M - 1) // TILE_M, 
                         (image_height + TILE_N - 1) // TILE_N, 
                         1)
     
-    # Preallocate buffers for preprocessed data
     num_points = points_warp.shape[0]
     radii = wp.zeros(num_points, dtype=int, device=DEVICE)
     points_xy_image = wp.zeros(num_points, dtype=wp.vec2, device=DEVICE)
@@ -686,8 +704,6 @@ def render_gaussians(
     rgb = wp.zeros(num_points, dtype=wp.vec3, device=DEVICE)
     conic_opacity = wp.zeros(num_points, dtype=wp.vec4, device=DEVICE)
     tiles_touched = wp.zeros(num_points, dtype=int, device=DEVICE)
-    
-    # Add clamped_state buffer to track which color channels are clamped
     clamped_state = wp.zeros(num_points, dtype=wp.vec3, device=DEVICE)
     
     if debug:
@@ -695,7 +711,8 @@ def render_gaussians(
         print(f"Colors: {'from SH' if colors is None else 'provided'}, SH degree: {degree}")
         print(f"Antialiasing: {antialiasing}, Prefiltered: {prefiltered}")
 
-    # Launch preprocessing kernel
+    # === PIPELINE STEP 2: PREPROCESSING ===
+    # Transform 3D Gaussians to screen space, project covariances, evaluate SH colors
     wp.launch(
         kernel=wp_preprocess,
         dim=(num_points,),
@@ -730,6 +747,8 @@ def render_gaussians(
             clamped_state,             # clamped_state
         ],
     )
+    # === PIPELINE STEP 3: SORTING & TILING ===
+    # Compute prefix sums to determine how many tile-Gaussian pairs each point generates
     point_offsets = wp.zeros(num_points, dtype=int, device=DEVICE)
     wp.launch(
         kernel=wp_prefix_sum,
@@ -744,10 +763,13 @@ def render_gaussians(
         # radix sort needs 2x memory
         raise ValueError("Number of rendered points exceeds the maximum supported by Warp.")
 
+    # Create unsorted lists for duplicated points and their sorting keys (tile_id << 32 | depth)
     point_list_keys_unsorted = wp.zeros(num_rendered, dtype=wp.int64, device=DEVICE)
     point_list_unsorted = wp.zeros(num_rendered, dtype=int, device=DEVICE)
     point_list_keys = wp.zeros(num_rendered, dtype=wp.int64, device=DEVICE)
     point_list = wp.zeros(num_rendered, dtype=int, device=DEVICE)
+    
+    # Duplicate points for each tile they touch, creating sort keys for depth ordering
     wp.launch(
         kernel=wp_duplicate_with_keys,
         dim=num_points,
@@ -761,18 +783,23 @@ def render_gaussians(
             tile_grid
         ]
     )
+    
+    # Sort points by combined tile_id and depth for efficient tile-based rasterization
     point_list_keys_unsorted_padded = wp.zeros(num_rendered * 2, dtype=wp.int64, device=DEVICE) 
     point_list_unsorted_padded = wp.zeros(num_rendered * 2, dtype=int, device=DEVICE)
     
-    # Copy data to padded arrays
+    # Copy data to padded arrays (radix sort requires extra space)
     wp.copy(point_list_keys_unsorted_padded, point_list_keys_unsorted)
     wp.copy(point_list_unsorted_padded, point_list_unsorted)
+    
+    # Perform radix sort to organize points by tile then depth (front-to-back)
     wp.utils.radix_sort_pairs(
         point_list_keys_unsorted_padded,  # keys to sort
         point_list_unsorted_padded,       # values to sort along with keys
         num_rendered                      # number of elements to sort
     )
 
+    # Copy sorted results back to working arrays
     wp.launch(
         kernel=wp_copy_int64,
         dim=num_rendered,
@@ -793,12 +820,14 @@ def render_gaussians(
         ]
     )
     
+    # Build tile ranges for efficient GPU access patterns
     tile_count = int(tile_grid[0] * tile_grid[1])
     ranges = wp.zeros(tile_count, dtype=wp.vec2i, device=DEVICE)  # each is (start, end)
 
     if num_rendered > 0:
+        # Identify start/end indices for each tile in the sorted point list
         wp.launch(
-            kernel=wp_identify_tile_ranges,  # You also need this kernel
+            kernel=wp_identify_tile_ranges,
             dim=num_rendered,
             inputs=[
                 num_rendered,
@@ -807,6 +836,8 @@ def render_gaussians(
             ]
         )
         
+        # === PIPELINE STEP 4: RASTERIZATION ===
+        # Render tiles in parallel, each thread handling one pixel with alpha compositing
         wp.launch(
             kernel=wp_render_gaussians,
             dim=(int(tile_grid[0]), int(tile_grid[1]), TILE_M, TILE_N),
@@ -828,9 +859,8 @@ def render_gaussians(
             ]
         )
         
-        # Launch the pixel stats tracking kernel as a fallback
-        # to make sure final_Ts and n_contrib are populated
-        # This is especially important for existing rendered pixels
+        # === PIPELINE STEP 5: POST-PROCESSING ===
+        # Track pixel statistics (transmittance and contributor counts) for gradient computation
         wp.launch(
             kernel=track_pixel_stats,
             dim=(image_width, image_height),

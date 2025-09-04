@@ -1,16 +1,30 @@
 """
-3D Gaussian Splatting - Backward Pass (Gradient Computation)
+3D Gaussian Splatting - Backward Gradient Computation Pipeline
 
-OPTIMIZATION CONCEPT: 3DGS learns by minimizing the difference between rendered images and training views.
-Unlike NeRF which optimizes neural network weights, 3DGS directly optimizes the Gaussian parameters.
+Mathematical Foundation:
+The backward pass computes gradients ∂L/∂θ for all learnable parameters θ using
+the chain rule through the differentiable rendering pipeline:
 
-BACKWARD PROCESS:
-1. Compare rendered pixels to ground truth images (L1 + SSIM loss)
-2. Compute gradients w.r.t. final pixel colors  
-3. Propagate gradients backward through the rendering pipeline
-4. Update Gaussian parameters: positions, scales, rotations, opacities, spherical harmonics
+∂L/∂θ = ∂L/∂C · ∂C/∂θ
 
-The gradients tell us how to adjust each Gaussian to better match the training images.
+Where:
+- L: Loss function (typically L1 + λ·SSIM between rendered and target images)
+- C: Rendered pixel color from forward pass
+- θ: Gaussian parameters {μ, Σ, α, c} (position, covariance, opacity, color)
+
+Gradient Flow:
+1. LOSS GRADIENTS: Compute ∂L/∂C for each pixel
+2. RASTERIZATION GRADIENTS: Backprop through alpha compositing ∂C/∂{α_i, c_i}
+3. PREPROCESSING GRADIENTS: Backprop through projection & SH evaluation
+4. PARAMETER GRADIENTS: Final gradients ∂L/∂θ for optimization
+
+Key Mathematical Operations:
+- Alpha compositing gradients: ∂C/∂α_i = c_i·T_i + α_i·∂T_i/∂α_i
+- Covariance gradients: ∂Σ_2D/∂Σ_3D through EWA projection chain rule
+- Spherical harmonics gradients: ∂c/∂c_l through viewing direction derivatives
+- Rotation/scale gradients: ∂Σ_3D/∂{R,S} through RSS^T decomposition
+
+This enables end-to-end gradient-based optimization of 3D Gaussian parameters.
 """
 
 import warp as wp
@@ -27,16 +41,11 @@ SH_C1 = 0.4886025119029199
 
 @wp.func
 def dnormvdv(v: wp.vec3, dv: wp.vec3) -> wp.vec3:
-    """
-    Computes the gradient of normalize(v) with respect to v, scaled by dv.
-    This is a direct port of the CUDA implementation.
+    """GRADIENT STEP 4A: Compute gradient of vector normalization ∂(v/|v|)/∂v
     
-    Args:
-        v: The input vector to be normalized
-        dv: The gradient vector to scale the result by
-        
-    Returns:
-        The gradient vector
+    Mathematical derivation:
+    For f(v) = v/|v|, we need ∂f/∂v = (I|v| - vv^T/|v|)/|v|²
+    This computes the gradient scaled by incoming gradient dv.
     """
     sum2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
     
@@ -54,7 +63,8 @@ def dnormvdv(v: wp.vec3, dv: wp.vec3) -> wp.vec3:
     
     return result
 
-# --- Backward Kernels ---
+# --- BACKWARD GRADIENT KERNELS ---
+
 @wp.kernel
 def sh_backward_kernel(
     # --- Inputs ---
@@ -71,6 +81,17 @@ def sh_backward_kernel(
     dL_dmeans: wp.array(dtype=wp.vec3),          # Accumulate mean grads here (N, 3)
     dL_dshs: wp.array(dtype=wp.vec3)             # Accumulate SH grads here (N * 16, 3)
 ):
+    """GRADIENT STEP 4: Backpropagate gradients through spherical harmonics evaluation
+    
+    Mathematical foundation:
+    Color c(d) = Σ_l c_l Y_l(d) where Y_l are spherical harmonic basis functions
+    
+    Computes:
+    - ∂L/∂c_l: Gradients w.r.t. SH coefficients via ∂c/∂c_l = Y_l(d)  
+    - ∂L/∂μ: Position gradients via ∂c/∂μ = Σ_l c_l ∂Y_l/∂d · ∂d/∂μ
+    
+    Where viewing direction d = normalize(μ - campos)
+    """
     idx = wp.tid()
     
     if idx >= num_points or radii[idx] <= 0: # Skip if not rendered
@@ -249,91 +270,134 @@ def compute_cov2d_backward_kernel(
     dL_dmeans: wp.array(dtype=wp.vec3),          # Accumulate mean grads here (N, 3)
     dL_dcov3Ds: wp.array(dtype=VEC6)             # Accumulate 3D cov grads here (N, 6)
 ):
+    """GRADIENT STEP 3: Backpropagate gradients through EWA 2D covariance projection
+    
+    Mathematical foundation:
+    2D covariance Σ_2D = J·W·Σ_3D·W^T·J^T where:
+    - J: Jacobian of perspective projection ∂p_screen/∂p_view  
+    - W: World-to-view transformation matrix
+    - Σ_3D: 3D covariance matrix in world space
+    
+    Computes:
+    - ∂L/∂Σ_3D: Gradients w.r.t. 3D covariance via chain rule
+    - ∂L/∂μ: Position gradients through projection derivatives
+    
+    This implements the EWA splatting gradient computation for screen-space projection.
+    """
     idx = wp.tid()
     if idx >= num_points or radii[idx] <= 0: # Skip if not rendered
         # Zero out dL_dcov3Ds to ensure we don't keep old values
         dL_dcov3Ds[idx] = VEC6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         return
     
-    mean = means[idx]
-    cov3D_packed = cov3Ds[idx] # VEC6
+    # Load input data for this Gaussian
+    mean = means[idx]                                                    # 3D world position
+    cov3D_packed = cov3Ds[idx]                                          # Packed 3D covariance (6 elements)
+    dL_dconic = wp.vec3(dL_dconics[idx][0], dL_dconics[idx][1], dL_dconics[idx][3])  # Extract (a,b,c) from conic grad
+
+    # Transform 3D position to view space
+    t = wp.vec4(mean[0], mean[1], mean[2], 1.0) * view_matrix           # Homogeneous view coordinates
+
+    # Define frustum limits (slightly larger than actual FOV for numerical stability)
+    limx = 1.3 * tan_fovx                                               # Extended horizontal limit
+    limy = 1.3 * tan_fovy                                               # Extended vertical limit
     
-    dL_dconic = wp.vec3(dL_dconics[idx][0], dL_dconics[idx][1], dL_dconics[idx][3])
+    # Perspective division for normalized device coordinates
+    tz = t[2]                                                           # View-space z (depth)
+    inv_tz = 1.0 / tz                                                   # Reciprocal for efficiency
+    txtz = t[0] * inv_tz                                                # Normalized x coordinate
+    tytz = t[1] * inv_tz                                                # Normalized y coordinate
 
-        
-    t = wp.vec4(mean[0], mean[1], mean[2], 1.0) * view_matrix
+    # Check if projection would be clamped (outside frustum)
+    x_clamped_flag = (txtz < -limx) or (txtz > limx)                   # X outside frustum bounds
+    y_clamped_flag = (tytz < -limy) or (tytz > limy)                   # Y outside frustum bounds
+    x_grad_mul = 1.0 - float(x_clamped_flag)                           # Zero gradients if clamped
+    y_grad_mul = 1.0 - float(y_clamped_flag)                           # Zero gradients if clamped
 
-    limx = 1.3 * tan_fovx
-    limy = 1.3 * tan_fovy
-    tz = t[2]
-    inv_tz = 1.0 / tz
-    txtz = t[0] * inv_tz
-    tytz = t[1] * inv_tz
+    # Clamp projected coordinates to frustum bounds
+    tx = wp.min(limx, wp.max(-limx, txtz)) * tz                        # Clamped view x
+    ty = wp.min(limy, wp.max(-limy, tytz)) * tz                        # Clamped view y
+    
+    # Precompute powers of inv_tz for Jacobian derivatives
+    inv_tz2 = inv_tz * inv_tz                                          # 1/z²
+    inv_tz3 = inv_tz2 * inv_tz                                         # 1/z³
 
-    x_clamped_flag = (txtz < -limx) or (txtz > limx)
-    y_clamped_flag = (tytz < -limy) or (tytz > limy)
-    x_grad_mul = 1.0 - float(x_clamped_flag) # 1.0 if not clamped, 0.0 if clamped
-    y_grad_mul = 1.0 - float(y_clamped_flag)
+    # Compute Jacobian of perspective projection: ∂p_screen/∂p_view
+    J00 = h_x * inv_tz                                                 # ∂px/∂vx = fx/vz
+    J11 = h_y * inv_tz                                                 # ∂py/∂vy = fy/vz
+    J02 = -h_x * tx * inv_tz2                                          # ∂px/∂vz = -fx*vx/vz²
+    J12 = -h_y * ty * inv_tz2                                          # ∂py/∂vz = -fy*vy/vz²
 
-    tx = wp.min(limx, wp.max(-limx, txtz)) * tz
-    ty = wp.min(limy, wp.max(-limy, tytz)) * tz
-    inv_tz2 = inv_tz * inv_tz
-    inv_tz3 = inv_tz2 * inv_tz
-
-    J00 = h_x * inv_tz
-    J11 = h_y * inv_tz
-    J02 = -h_x * tx * inv_tz2
-    J12 = -h_y * ty * inv_tz2
-
+    # Build perspective projection Jacobian matrix (transposed for convenience)
     J = wp.transpose(wp.mat33(
         J00, 0.0, J02,
         0.0, J11, J12,
         0.0, 0.0, 0.0
     ))
-    
-    
 
+    # Extract world-to-view rotation matrix from view matrix
     W = wp.mat33(
         view_matrix[0,0], view_matrix[0,1], view_matrix[0,2],
         view_matrix[1,0], view_matrix[1,1], view_matrix[1,2],
         view_matrix[2,0], view_matrix[2,1], view_matrix[2,2]
     )
 
+    # Combined transformation matrix T = W * J (world→view→screen)
     T = W * J
-    c0 = cov3D_packed[0]; c1 = cov3D_packed[1]; c2 = cov3D_packed[2]
-    c11 = cov3D_packed[3]; c12 = cov3D_packed[4]; c22 = cov3D_packed[5]
-    Vrk = wp.mat33(c0, c1, c2, c1, c11, c12, c2, c12, c22) # Assumes VEC6 stores upper triangle row-wise
     
+    # Unpack 3D covariance matrix from VEC6 format (upper triangle)
+    c0 = cov3D_packed[0]; c1 = cov3D_packed[1]; c2 = cov3D_packed[2]   # First row: [c00, c01, c02]
+    c11 = cov3D_packed[3]; c12 = cov3D_packed[4]; c22 = cov3D_packed[5] # Diagonal and remaining: [c11, c12, c22]
+    Vrk = wp.mat33(c0, c1, c2, c1, c11, c12, c2, c12, c22)             # Reconstruct symmetric 3x3 matrix
+    
+    # EWA splatting: Project 3D covariance to 2D screen space
+    # Formula: Σ_2D = T^T * Σ_3D * T (where T combines view transform and projection Jacobian)
     cov2D_mat = wp.transpose(T) * wp.transpose(Vrk) * T
 
-    a_noblr = cov2D_mat[0,0]
-    b_noblr = cov2D_mat[0,1] 
-    c_noblr = cov2D_mat[1,1]
-    a = a_noblr + 0.3
-    b = b_noblr
-    c = c_noblr + 0.3
+    # Extract 2D covariance matrix elements
+    a_noblr = cov2D_mat[0,0]                                           # σ_xx before low-rank correction
+    b_noblr = cov2D_mat[0,1]                                           # σ_xy before low-rank correction  
+    c_noblr = cov2D_mat[1,1]                                           # σ_yy before low-rank correction
+    
+    # Add low-rank correction to ensure positive definiteness
+    a = a_noblr + 0.3                                                  # σ_xx + regularization
+    b = b_noblr                                                        # σ_xy (unchanged)
+    c = c_noblr + 0.3                                                  # σ_yy + regularization
 
-    denom = a * c - b * b
-    dL_da = 0.0; dL_db = 0.0; dL_dc = 0.0
+    # Compute determinant for matrix inversion (needed for conic form)
+    denom = a * c - b * b                                              # det(Σ_2D) = σ_xx*σ_yy - σ_xy²
+    dL_da = 0.0; dL_db = 0.0; dL_dc = 0.0                             # Initialize gradients
         
-    # --- Calculate Gradients ---
+    # Compute gradients of 2D covariance matrix elements
     if denom != 0.0:
-        # Use a small epsilon to prevent division by zero
-        denom2inv = 1.0 / (denom * denom + 1e-7)
+        # Gradients come from inverting 2D covariance to get conic matrix
+        # Conic matrix inverse: [c, -b; -b, a] / det for quadratic form (x-μ)ᵀΣ⁻¹(x-μ)
+        denom2inv = 1.0 / (denom * denom + 1e-7)                       # 1/det² with numerical stability
+        
+        # ∂L/∂a = ∂L/∂conic * ∂conic/∂a (chain rule through matrix inversion)
         dL_da = denom2inv * (-c * c * dL_dconic[0] + 2.0 * b * c * dL_dconic[1] + (denom - a * c) * dL_dconic[2])
         dL_dc = denom2inv * (-a * a * dL_dconic[2] + 2.0 * a * b * dL_dconic[1] + (denom - a * c) * dL_dconic[0])
         dL_db = denom2inv * 2.0 * (b * c * dL_dconic[0] - (denom + 2.0 * b * b) * dL_dconic[1] + a * b * dL_dconic[2])
 
+    # Backpropagate gradients through EWA projection: ∂L/∂Σ_3D via chain rule
+    # Using: ∂(T^T * Σ_3D * T)/∂Σ_3D where each element involves products of T entries
     dL_dcov3Ds[idx] = VEC6(
-        # Diagonal elements
-        T[0][0] * T[0][0] * dL_da + T[0][0] * T[0][1] * dL_db + T[0][1] * T[0][1] * dL_dc,  # c00
-        2.0 * T[0][0] * T[1][0] * dL_da + (T[0][0] * T[1][1] + T[1][0] * T[0][1]) * dL_db + 2.0 * T[0][1] * T[1][1] * dL_dc,  # c01
-        2.0 * T[0][0] * T[2][0] * dL_da + (T[0][0] * T[2][1] + T[2][0] * T[0][1]) * dL_db + 2.0 * T[0][1] * T[2][1] * dL_dc,  # c02
-        T[1][0] * T[1][0] * dL_da + T[1][0] * T[1][1] * dL_db + T[1][1] * T[1][1] * dL_dc,  # c11
-        2.0 * T[2][0] * T[1][0] * dL_da + (T[1][0] * T[2][1] + T[2][0] * T[1][1]) * dL_db + 2.0 * T[1][1] * T[2][1] * dL_dc,  # c12
-        T[2][0] * T[2][0] * dL_da + T[2][0] * T[2][1] * dL_db + T[2][1] * T[2][1] * dL_dc   # c22
+        # ∂L/∂c00: Gradient w.r.t. 3D covariance (0,0) element
+        T[0][0] * T[0][0] * dL_da + T[0][0] * T[0][1] * dL_db + T[0][1] * T[0][1] * dL_dc,  
+        # ∂L/∂c01: Gradient w.r.t. 3D covariance (0,1) element (symmetric, appears twice)
+        2.0 * T[0][0] * T[1][0] * dL_da + (T[0][0] * T[1][1] + T[1][0] * T[0][1]) * dL_db + 2.0 * T[0][1] * T[1][1] * dL_dc,  
+        # ∂L/∂c02: Gradient w.r.t. 3D covariance (0,2) element  
+        2.0 * T[0][0] * T[2][0] * dL_da + (T[0][0] * T[2][1] + T[2][0] * T[0][1]) * dL_db + 2.0 * T[0][1] * T[2][1] * dL_dc,  
+        # ∂L/∂c11: Gradient w.r.t. 3D covariance (1,1) element
+        T[1][0] * T[1][0] * dL_da + T[1][0] * T[1][1] * dL_db + T[1][1] * T[1][1] * dL_dc,  
+        # ∂L/∂c12: Gradient w.r.t. 3D covariance (1,2) element
+        2.0 * T[2][0] * T[1][0] * dL_da + (T[1][0] * T[2][1] + T[2][0] * T[1][1]) * dL_db + 2.0 * T[1][1] * T[2][1] * dL_dc,  
+        # ∂L/∂c22: Gradient w.r.t. 3D covariance (2,2) element
+        T[2][0] * T[2][0] * dL_da + T[2][0] * T[2][1] * dL_db + T[2][1] * T[2][1] * dL_dc   
     )
 
+    # Compute gradients w.r.t. transformation matrix T for position gradients
+    # ∂L/∂T using product rule: ∂(T^T * Σ_3D * T)/∂T
     dL_dT00 = 2.0 * (T[0][0] * Vrk[0][0] + T[1][0] * Vrk[1][0] + T[2][0] * Vrk[2][0]) * dL_da + \
               (T[0][1] * Vrk[0][0] + T[1][1] * Vrk[1][0] + T[2][1] * Vrk[2][0]) * dL_db
     dL_dT01 = 2.0 * (T[0][0] * Vrk[0][1] + T[1][0] * Vrk[1][1] + T[2][0] * Vrk[2][1]) * dL_da + \
@@ -347,20 +411,27 @@ def compute_cov2d_backward_kernel(
     dL_dT12 = 2.0 * (T[0][1] * Vrk[0][2] + T[1][1] * Vrk[1][2] + T[2][1] * Vrk[2][2]) * dL_dc + \
               (T[0][0] * Vrk[0][2] + T[1][0] * Vrk[1][2] + T[2][0] * Vrk[2][2]) * dL_db
 
-    dL_dJ00 = W[0,0] * dL_dT00 + W[1,0] * dL_dT01 + W[2,0] * dL_dT02
-    dL_dJ02 = W[0,2] * dL_dT00 + W[1,2] * dL_dT01 + W[2,2] * dL_dT02
-    dL_dJ11 = W[0,1] * dL_dT10 + W[1,1] * dL_dT11 + W[2,1] * dL_dT12
-    dL_dJ12 = W[0,2] * dL_dT10 + W[1,2] * dL_dT11 + W[2,2] * dL_dT12
+    # Backpropagate through T = W * J to get Jacobian gradients
+    # ∂L/∂J = W^T * ∂L/∂T (since T = W*J, so ∂T/∂J = W)
+    dL_dJ00 = W[0,0] * dL_dT00 + W[1,0] * dL_dT01 + W[2,0] * dL_dT02    # ∂L/∂(∂px/∂vx)
+    dL_dJ02 = W[0,2] * dL_dT00 + W[1,2] * dL_dT01 + W[2,2] * dL_dT02    # ∂L/∂(∂px/∂vz)
+    dL_dJ11 = W[0,1] * dL_dT10 + W[1,1] * dL_dT11 + W[2,1] * dL_dT12    # ∂L/∂(∂py/∂vy)
+    dL_dJ12 = W[0,2] * dL_dT10 + W[1,2] * dL_dT11 + W[2,2] * dL_dT12    # ∂L/∂(∂py/∂vz)
 
-    dL_dtx = -h_x * inv_tz2 * dL_dJ02
-    dL_dty = -h_y * inv_tz2 * dL_dJ12
-    dL_dtz = -h_x * inv_tz2 * dL_dJ00 - h_y * inv_tz2 * dL_dJ11 + \
+    # Compute gradients w.r.t. view coordinates t using Jacobian derivatives
+    # From J_ij = ∂screen_i/∂view_j, we get ∂L/∂view_j via chain rule
+    dL_dtx = -h_x * inv_tz2 * dL_dJ02                                   # ∂L/∂vx (through perspective division)
+    dL_dty = -h_y * inv_tz2 * dL_dJ12                                   # ∂L/∂vy (through perspective division)  
+    dL_dtz = -h_x * inv_tz2 * dL_dJ00 - h_y * inv_tz2 * dL_dJ11 + \     # ∂L/∂vz (complex due to perspective)
              2.0 * h_x * tx * inv_tz3 * dL_dJ02 + 2.0 * h_y * ty * inv_tz3 * dL_dJ12
 
-    dL_dt = wp.vec3(dL_dtx * x_grad_mul, dL_dty * y_grad_mul, dL_dtz)
+    # Apply gradient multipliers to zero out gradients for clamped coordinates  
+    dL_dt = wp.vec3(dL_dtx * x_grad_mul, dL_dty * y_grad_mul, dL_dtz)   # Zero if outside frustum
 
+    # Transform view-space gradients back to world space using inverse view matrix
+    # ∂L/∂world = ∂L/∂view * ∂view/∂world = ∂L/∂view * V^(-T) = ∂L/∂view * V^T
     dL_dmean_from_cov = wp.vec4(dL_dt[0], dL_dt[1], dL_dt[2], 1.0) * wp.transpose(view_matrix)
-    dL_dmeans[idx] += wp.vec3(dL_dmean_from_cov[0], dL_dmean_from_cov[1], dL_dmean_from_cov[2])
+    dL_dmeans[idx] += wp.vec3(dL_dmean_from_cov[0], dL_dmean_from_cov[1], dL_dmean_from_cov[2])  # Accumulate position gradients
 
 
 @wp.kernel
@@ -377,6 +448,20 @@ def compute_cov3d_backward_kernel(
     dL_dscales: wp.array(dtype=wp.vec3),         # Write scale grads here (N, 3)
     dL_drots: wp.array(dtype=wp.vec4)            # Write rot grads here (N, 4)
 ):
+    """GRADIENT STEP 2: Backpropagate gradients through 3D covariance decomposition
+    
+    Mathematical foundation:
+    3D covariance matrix Σ_3D = R·S·S^T·R^T where:
+    - R: Rotation matrix from quaternion q = (x,y,z,w)
+    - S: Diagonal scale matrix S = diag(s_x, s_y, s_z)
+    
+    Computes:
+    - ∂L/∂s: Scale gradients via ∂Σ/∂s through matrix differentiation
+    - ∂L/∂q: Quaternion gradients via ∂Σ/∂R and ∂R/∂q
+    
+    This ensures numerical stability by parameterizing covariance through 
+    rotation and scale rather than directly optimizing the 6 matrix elements.
+    """
     idx = wp.tid()
     # Skip if not rendered OR if grad input is zero (e.g., from compute_cov2d_backward)
     if idx >= num_points or radii[idx] <= 0:
@@ -472,22 +557,15 @@ def compute_cov3d_backward_kernel(
 @wp.kernel
 def wp_render_backward_kernel(
     # --- Inputs ---
-    # Tile/Range data
     ranges: wp.array(dtype=wp.vec2i),            # Range of point indices for each tile (start, end)
     point_list: wp.array(dtype=int),             # Sorted point indices
-    
-    # Image parameters
     W: int,                                      # Image width
     H: int,                                      # Image height
     bg_color: wp.vec3,                           # Background color
     tile_grid: wp.vec3,                          # Tile grid dimensions
-    
-    # Gaussian parameters
     points_xy_image: wp.array(dtype=wp.vec2),    # 2D projected positions
     conic_opacity: wp.array(dtype=wp.vec4),      # Conic matrices and opacities (a, b, c, opacity)
     colors: wp.array(dtype=wp.vec3),             # RGB colors
-    
-    # Forward pass results
     final_Ts: wp.array2d(dtype=float),           # Final transparency values
     n_contrib: wp.array2d(dtype=int),            # Number of Gaussians contributing to each pixel
     dL_dpixels: wp.array2d(dtype=wp.vec3),       # Gradient of loss w.r.t. output pixels
@@ -498,12 +576,17 @@ def wp_render_backward_kernel(
     dL_dopacity: wp.array(dtype=float),          # Gradient w.r.t. opacity
     dL_dcolors: wp.array(dtype=wp.vec3),         # Gradient w.r.t. colors
 ):
-    """
-    Backward version of the rendering procedure, computing gradients of the loss with respect
-    to Gaussian parameters based on gradients of the loss with respect to output pixels.
+    """GRADIENT STEP 1: Backpropagate gradients through alpha compositing rasterization
     
-    This kernel is launched per pixel and processes Gaussians in back-to-front order,
-    similar to the forward rendering pass but accumulating gradients.
+    Mathematical foundation:
+    For alpha compositing C = Σᵢ αᵢcᵢ ∏ⱼ<ᵢ(1-αⱼ), compute gradients:
+    - ∂L/∂cᵢ = ∂L/∂C · αᵢ · Tᵢ (color gradients)
+    - ∂L/∂αᵢ = ∂L/∂C · (cᵢTᵢ - Σⱼ>ᵢ αⱼcⱼTⱼ/Tᵢ) (opacity gradients)
+    
+    Where Tᵢ = ∏ⱼ<ᵢ(1-αⱼ) is transmittance up to layer i.
+    
+    This kernel processes each pixel tile-by-tile, accumulating gradients
+    for all Gaussians affecting each pixel through the depth-sorted rendering.
     """
     # Get pixel coordinates
     tile_x, tile_y, tid_x, tid_y = wp.tid()
@@ -633,10 +716,15 @@ def compute_projection_backward_kernel(
     # --- Outputs (Accumulate) ---
     dL_dmeans: wp.array(dtype=wp.vec3)           # Accumulate mean grads here (N, 3)
 ):
-    """Compute gradients of 3D means due to projection to 2D.
+    """GRADIENT STEP 5: Backpropagate gradients through perspective projection
     
-    This kernel handles the gradient propagation from 2D projected positions
-    back to 3D positions, based on the projection matrix.
+    Mathematical foundation:
+    For perspective projection p_2D = P·p_3D where P is projection matrix:
+    - Computes ∂L/∂μ_3D via chain rule: ∂L/∂μ_2D · ∂μ_2D/∂μ_3D
+    - Handles perspective division and homogeneous coordinates
+    
+    This accumulates position gradients from 2D screen-space derivatives
+    back to 3D world-space Gaussian centers.
     """
     idx = wp.tid()
     if idx >= num_points or radii[idx] <= 0: # Skip if not rendered
@@ -897,13 +985,22 @@ def backward(
     degree=3,
     debug=False,
 ):
-    """
-    Main backward function for 3D Gaussian Splatting.
+    """GRADIENT PIPELINE: Complete backward pass through 3D Gaussian Splatting
     
-    This function orchestrates the entire backward pass by calling two main sub-functions:
-    1. backward_render: Computes gradients w.r.t. 2D parameters (mean2D, conic, opacity, color)
-    2. backward_preprocess: Computes gradients w.r.t. 3D parameters 
-       (mean3D, cov3D, SH coefficients, scales, rotations)
+    Orchestrates the complete gradient computation pipeline:
+    
+    STEP 1: backward_render() - Rasterization gradients
+    - Backpropagate through alpha compositing: ∂L/∂{c_i, α_i}
+    - Compute gradients for 2D projected means and conic matrices
+    
+    STEP 2: backward_preprocess() - Preprocessing gradients  
+    - Backpropagate through spherical harmonics: ∂L/∂{c_l, μ}
+    - Backpropagate through covariance projection: ∂L/∂{Σ_3D, μ}
+    - Backpropagate through covariance decomposition: ∂L/∂{R, s}
+    - Backpropagate through perspective projection: ∂L/∂μ
+    
+    Returns gradients for all learnable parameters: positions, scales, 
+    rotations, opacities, and spherical harmonic coefficients.
     
     Args:
         background: Background color as numpy array, torch tensor, or wp.vec3 (3,)

@@ -43,4 +43,36 @@ def to_warp_array(data, dtype, shape_check=None, flatten=False):
         data = data.flatten()
     return wp.array(data, dtype=dtype, device=DEVICE)
 
+@wp.kernel
+def wp_prefix_sum(input_array: wp.array(dtype=int),
+                      output_array: wp.array(dtype=int)):
+    """Compute prefix sum (cumulative sum) of input array.
+    
+    Used in 3DGS to determine memory offsets for point duplication across tiles.
+    """
+    tid = wp.tid()
+    
+    if tid == 0:
+        output_array[0] = input_array[0]
+        
+        # Perform prefix sum
+        for i in range(1, input_array.shape[0]):
+            output_array[i] = output_array[i-1] + input_array[i]
+
+
+@wp.kernel
+def wp_copy_int64(src: wp.array(dtype=wp.int64), dst: wp.array(dtype=wp.int64), count: int):
+    """Copy int64 array elements - used for transferring sorted keys after radix sort."""
+    i = wp.tid()
+    if i < count:
+        dst[i] = src[i]
+        
+
+@wp.kernel
+def wp_copy_int(src: wp.array(dtype=int), dst: wp.array(dtype=int), count: int):
+    """Copy int array elements - used for transferring sorted indices after radix sort."""
+    i = wp.tid()
+    if i < count:
+        dst[i] = src[i]
+
 

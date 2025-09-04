@@ -1,19 +1,13 @@
 """
 3D Gaussian Splatting - Training Pipeline
 
-TRAINING CONCEPT: Learn a 3D scene representation from 2D images using 3D Gaussians.
-
-FULL 3DGS TRAINING LOOP:
-1. Initialize: Create random 3D Gaussians from sparse point cloud (SfM)
-2. Forward: Render image from current camera view using Gaussian splatting  
-3. Loss: Compare rendered image to ground truth (L1 + SSIM)
-4. Backward: Compute gradients for all Gaussian parameters
-5. Optimize: Update parameters using Adam optimizer
-6. Densify: Add/split/prune Gaussians to improve representation
-7. Repeat until convergence
-
-KEY INSIGHT: No neural networks! Just direct optimization of Gaussian parameters.
-This makes it much faster than NeRF while achieving similar or better quality.
+1. Initialize Gaussians from sparse point cloud
+2. Render image using Gaussian splatting
+3. Compute L1 loss against ground truth
+4. Backpropagate gradients
+5. Update parameters with Adam
+6. Densify: add/split/prune Gaussians
+7. Repeat
 """
 
 import os
@@ -69,16 +63,32 @@ def init_gaussian_params(
     # Initialize rotations to identity matrix
     rotations[i] = wp.vec4(1.0, 0.0, 0.0, 0.0)
     
-    # Initialize opacities
     opacities[i] = 0.1
     
-    # Initialize SH coefficients (just DC term for now)
-    for j in range(16):  # degree=3, total 16 coefficients
+    # SPHERICAL HARMONICS: View-dependent color representation
+    # Mathematical basis: c(d) = Σ_{l=0}^{L} Σ_{m=-l}^{l} c_l^m Y_l^m(d)
+    # where d is view direction, Y_l^m are spherical harmonic basis functions
+    #
+    # Why SH? Compact representation of smooth functions on sphere:
+    # - Degree 0 (DC): constant color (Lambertian)
+    # - Degree 1: linear variation (rough materials)  
+    # - Degree 2: quadratic (glossy materials, simple reflections)
+    # - Degree 3: cubic (complex view-dependent effects)
+    #
+    # Coefficient count: (L+1)² total coefficients
+    # L=0: 1 coeff,  L=1: 4 coeffs,  L=2: 9 coeffs,  L=3: 16 coeffs
+    #
+    # Rendering: For viewing direction d = (x,y,z):
+    # color = SH_C0*c₀ + SH_C1*(-y*c₁ + z*c₂ - x*c₃) + ... (higher order terms)
+    for j in range(16):
         idx = i * 16 + j
-        # Slight random initialization with positive bias
         if j == 0:
+            # DC term: Y₀⁰ = 1/(2√π) ≈ 0.282, controls base diffuse color
+            # Initialize slightly negative: 0.282 * (-0.007) ≈ -0.002 → sigmoid(x+0.5) ≈ 0.5 (neutral gray)
             shs[idx] = wp.vec3(-0.007, -0.007, -0.007)
         else:
+            # Higher order coefficients start at zero (pure Lambertian initially)
+            # Training will learn view-dependent effects by optimizing these coefficients
             shs[idx] = wp.vec3(0.0, 0.0, 0.0)
 
 @wp.kernel
@@ -93,7 +103,7 @@ def zero_gradients(
     i = wp.tid()
     if i >= num_points:
         return
-    
+
     pos_grad[i] = wp.vec3(0.0, 0.0, 0.0)
     scale_grad[i] = wp.vec3(0.0, 0.0, 0.0)
     rot_grad[i] = wp.vec4(0.0, 0.0, 0.0, 0.0)
@@ -141,20 +151,17 @@ class NeRFGaussianSplattingTrainer:
         print(f"Loaded {len(self.val_cameras)} val cameras and {len(self.val_image_paths)} val images")
         print(f"Loaded {len(self.test_cameras)} test cameras and {len(self.test_image_paths)} test images")
         
-        # Calculate scene extent for densification
         self.scene_extent = self.calculate_scene_extent()
         print(f"Calculated scene extent: {self.scene_extent}")
         
-        # Initialize parameters
         self.num_points = self.config['num_points']
         self.params = self.initialize_parameters()
         
-        # Create gradient arrays
         self.grads = self.create_gradient_arrays()
         
-        # Create optimizer state
-        self.adam_m = self.create_gradient_arrays()  # First moment
-        self.adam_v = self.create_gradient_arrays()  # Second moment
+        # Adam optimizer state: first and second moments
+        self.adam_m = self.create_gradient_arrays()
+        self.adam_v = self.create_gradient_arrays()
         
         # Initialize densification state tracking
         self.init_densification_state()
@@ -164,9 +171,6 @@ class NeRFGaussianSplattingTrainer:
         
         # Initialize intermediate buffers dictionary
         self.intermediate_buffers = {}
-        
-        # Track iteration for opacity reset
-        self.opacity_reset_at = -32768
     
     def create_lr_scheduler(self):
         """Create simple learning rate schedulers for each parameter type."""
@@ -345,7 +349,37 @@ class NeRFGaussianSplattingTrainer:
         )
      
     def densification_and_pruning(self, iteration):
-        """Perform sophisticated densification and pruning of Gaussians."""
+        """
+        ADAPTIVE DENSIFICATION: Core 3DGS innovation for geometry optimization
+        
+        Problem: Initial Gaussian placement from SfM is sparse and suboptimal
+        Solution: Iteratively add/remove Gaussians based on reconstruction error
+        
+        Key insight: High gradients indicate areas needing more representation detail
+        - Large gradients + large Gaussians → SPLIT (over-reconstruction)
+        - Large gradients + small Gaussians → CLONE (under-sampling)
+        - Low opacity Gaussians → PRUNE (unnecessary complexity)
+        
+        Mathematical foundation:
+        For each Gaussian i, track accumulated positional gradient magnitude:
+        ∇_i = ||∂L/∂μ_i||_2 over recent iterations
+        
+        Densification criteria:
+        1. SPLIT: ∇_i > τ_grad AND max(scale_i) > τ_scale * scene_extent  
+           → Create 2 smaller Gaussians along maximum scale axis
+        2. CLONE: ∇_i > τ_grad AND max(scale_i) ≤ τ_scale * scene_extent
+           → Duplicate Gaussian with small position perturbation  
+        3. PRUNE: opacity_i < τ_opacity
+           → Remove Gaussian (contributes negligibly to final image)
+           
+        Why this works:
+        - Gradient magnitude ∝ reconstruction error at that location
+        - Large Gaussians with high gradients are "trying to do too much" → split
+        - Small Gaussians with high gradients need "help" → clone
+        - Transparent Gaussians waste computation → prune
+        
+        This creates an adaptive mesh that focuses detail where needed.
+        """
         
         # Check if we should do densification
         densify_from_iter = self.config.get('densify_from_iter', 500)
