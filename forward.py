@@ -267,14 +267,15 @@ def wp_preprocess(
     H_float = float(H)
     C = 3  # RGB channels
     
-    # Add blur/antialiasing factor to covariance
+    # Add low-pass filter for antialiasing (prevents aliasing of small Gaussians)
     det_cov = cov2d[0] * cov2d[2] - cov2d[1] * cov2d[1]
     cov_with_blur = wp.vec3(cov2d[0] + h_var, cov2d[1], cov2d[2] + h_var)
     det_cov_plus_h_cov = cov_with_blur[0] * cov_with_blur[2] - cov_with_blur[1] * cov_with_blur[1]
     
-    # Invert covariance (EWA algorithm)
+    # Invert 2D covariance matrix to get conic form for efficient evaluation
+    # Quadratic form: (x-μ)ᵀ Σ⁻¹ (x-μ) where Σ⁻¹ = [[c,-b],[-b,a]]/det
     det = det_cov_plus_h_cov
-    if det == 0.0:
+    if det == 0.0:  # Degenerate case: Gaussian has zero area
         return
         
     det_inv = 1.0 / det
@@ -283,11 +284,13 @@ def wp_preprocess(
         -cov_with_blur[1] * det_inv, 
         cov_with_blur[0] * det_inv
     )
-    # Compute eigenvalues of covariance matrix to find screen-space extent
+    # Compute eigenvalues of 2D covariance matrix to determine screen-space extent
+    # For 2x2 matrix [[a,b],[b,c]], eigenvalues are: λ = (a+c)/2 ± √((a+c)²/4 - ac + b²)
     mid = 0.5 * (cov_with_blur[0] + cov_with_blur[2])
-    lambda1 = mid + wp.sqrt(wp.max(0.1, mid * mid - det))
-    lambda2 = mid - wp.sqrt(wp.max(0.1, mid * mid - det))
-    my_radius = wp.ceil(3.0 * wp.sqrt(wp.max(lambda1, lambda2)))
+    lambda1 = mid + wp.sqrt(wp.max(0.1, mid * mid - det))  # Larger eigenvalue
+    lambda2 = mid - wp.sqrt(wp.max(0.1, mid * mid - det))  # Smaller eigenvalue
+    # 3-sigma rule: 99.7% of Gaussian mass lies within 3σ from center
+    my_radius = wp.ceil(3.0 * wp.sqrt(wp.max(lambda1, lambda2)))  # Screen radius in pixels
     # Convert to pixel coordinates
     point_image = wp.vec2(ndc2pix(p_proj[0], W_float), ndc2pix(p_proj[1], H_float))
     
@@ -340,7 +343,7 @@ def wp_preprocess(
                 result = result + 1.445305721320277 * z * (xx - yy) * shs[base_idx + 14]
                 result = result + (-0.5900435899266435) * x * (xx - 3.0 * yy) * shs[base_idx + 15]
     
-    result = result + wp.vec3(0.5, 0.5, 0.5)
+    result = result + wp.vec3(0.5, 0.5, 0.5)  # Add 0.5 offset for color range [0,1]
     
     # Track which color channels are clamped (using wp.vec3 instead of separate uint32 values)
     # Store 1.0 if clamped, 0.0 if not clamped

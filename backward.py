@@ -112,6 +112,7 @@ def sh_backward_kernel(
     x = dir[0]; y = dir[1]; z = dir[2]
 
     # --- Apply clamping mask to input gradient ---
+    # If clamping was applied during forward pass, gradient becomes 0 for that channel
     dL_dRGB = dL_dcolor[idx]
     dL_dRGB = wp_vec3_mul_element(dL_dRGB, wp_vec3_add_element(wp.vec3(1.0, 1.0, 1.0), -1.0 * clamped_state[idx]))
 
@@ -121,7 +122,7 @@ def sh_backward_kernel(
     dRGBdz = wp.vec3(0.0, 0.0, 0.0)
 
     # --- Degree 0 ---
-    # Direct assignment for clarity (matching CUDA style)
+    # Compute gradients for spherical harmonic coefficients using chain rule
     dRGBdsh0 = SH_C0
     dL_dshs[base_sh_idx] = dRGBdsh0 * dL_dRGB
 
@@ -359,7 +360,8 @@ def compute_cov2d_backward_kernel(
     b_noblr = cov2D_mat[0,1]                                           # σ_xy before low-rank correction  
     c_noblr = cov2D_mat[1,1]                                           # σ_yy before low-rank correction
     
-    # Add low-rank correction to ensure positive definiteness
+    # Add low-rank correction to ensure positive definiteness and numerical stability
+    # This regularization prevents singular matrices during inversion
     a = a_noblr + 0.3                                                  # σ_xx + regularization
     b = b_noblr                                                        # σ_xy (unchanged)
     c = c_noblr + 0.3                                                  # σ_yy + regularization
@@ -422,8 +424,7 @@ def compute_cov2d_backward_kernel(
     # From J_ij = ∂screen_i/∂view_j, we get ∂L/∂view_j via chain rule
     dL_dtx = -h_x * inv_tz2 * dL_dJ02                                   # ∂L/∂vx (through perspective division)
     dL_dty = -h_y * inv_tz2 * dL_dJ12                                   # ∂L/∂vy (through perspective division)  
-    dL_dtz = -h_x * inv_tz2 * dL_dJ00 - h_y * inv_tz2 * dL_dJ11 + \     # ∂L/∂vz (complex due to perspective)
-             2.0 * h_x * tx * inv_tz3 * dL_dJ02 + 2.0 * h_y * ty * inv_tz3 * dL_dJ12
+    dL_dtz = -h_x * inv_tz2 * dL_dJ00 - h_y * inv_tz2 * dL_dJ11 + 2.0 * h_x * tx * inv_tz3 * dL_dJ02 + 2.0 * h_y * ty * inv_tz3 * dL_dJ12 # ∂L/∂vz (complex due to perspective)
 
     # Apply gradient multipliers to zero out gradients for clamped coordinates  
     dL_dt = wp.vec3(dL_dtx * x_grad_mul, dL_dty * y_grad_mul, dL_dtz)   # Zero if outside frustum
