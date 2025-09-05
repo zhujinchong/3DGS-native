@@ -87,10 +87,6 @@ python train.py
 
 Densification and pruning logic is based on [yzslab/gaussian-splatting-lightning](https://github.com/yzslab/gaussian-splatting-lightning), but restructured here with minimal data preparation and simplified training logic.
 
-
-## Performance
-01:46
-
 ## License
 
 This project is licensed under the **GNU Affero General Public License v3.0**.  
