@@ -8,7 +8,7 @@
 
 目标很简单：**好懂、好改、好跑**。
 
-![3DGS训练过程](./assets/rendering_demo.gif)
+![3DGS训练过程](./examples/example_train_lego.gif)
 
 ---
 
