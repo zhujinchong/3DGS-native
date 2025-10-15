@@ -16,7 +16,7 @@ Explore differentiable rendering and parallel graphics through clean, readable P
 
 This isn’t another massive codebase. It’s designed for clarity and experimentation. Strips away complexity so you can focus on understanding how Gaussian Splatting really works.
 
-![The training video](examples/example_train_lego.gif)
+![The training video](assets/example_train_lego.gif)
 
 ## Quick Start
 
@@ -47,7 +47,7 @@ python render.py
 ```
 You should see 3 Gaussian points like:
 
-<img src="examples/example_render.png" alt="this" width="300"/>
+<img src="assets/example_render.png" alt="this" width="300"/>
 
 ### Training
 
