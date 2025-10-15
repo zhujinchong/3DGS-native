@@ -29,7 +29,7 @@ class GaussianParams:
     # === TRAINING CONFIGURATION ===
     num_iterations = 7000  # Default number of training iterations
     num_points = 5000      # Initial number of Gaussian points
-    save_interval = 300    # Save checkpoint every N iterations
+    save_interval = 500    # Save checkpoint every N iterations
 
     # === LEARNING RATE SCHEDULE ===
     use_lr_scheduler = True
